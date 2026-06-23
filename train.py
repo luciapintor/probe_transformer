@@ -19,139 +19,19 @@ Soluzione: BalancedBatchSampler
 
 Valore consigliato: K=20 classi, M=8 probe per classe -> batch di 160.
 Con 39 classi totali e batch di 160, ogni batch copre ~51% delle classi.
-
-Uso da riga di comando:
-    python train.py 
-
-Uso da codice:
-    from train import train
-    train(csv_path="all_A_full.csv", epochs=50)
 """
 
 import random
 import numpy as np
 import torch
-import torch.nn as nn
 from torch.utils.data import DataLoader
-from collections import defaultdict
 
 from utils.BalancedBatchSampler import BalancedBatchSampler
 from utils.preprocessing import load_csv, build_datasets
 from utils.model import ProbeEncoder, TransformerConfig
 from utils.losses import CombinedLoss
-
-# -----------------------------------------------------------------------
-# Training e validation step
-# -----------------------------------------------------------------------
-
-def train_epoch(
-    model: ProbeEncoder,
-    loader: DataLoader,
-    optimizer: torch.optim.Optimizer,
-    loss_fn: CombinedLoss,
-    device: torch.device,
-    grad_clip: float = 1.0,
-) -> dict:
-    """
-    Esegue una singola epoca di training.
-    Restituisce un dizionario con le loss medie (total, supcon, ce).
-    """
-    model.train()
-    totals = defaultdict(float)
-    n_batches = 0
-
-    for x, labels in loader:
-        x      = x.to(device)
-        labels = labels.to(device)
-
-        # Forward pass: ottieni embedding L2-normalizzati
-        z = model(x, normalize=True)
-
-        # Calcola la loss
-        loss, components = loss_fn(z, labels)
-
-        # Backward pass
-        optimizer.zero_grad()
-        loss.backward()
-
-        # Gradient clipping: evita esplosione dei gradienti,
-        # specialmente utile con transformer e learning rate alte
-        nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip)
-
-        optimizer.step()
-
-        # Accumula metriche
-        for k, v in components.items():
-            totals[k] += v
-        n_batches += 1
-
-    return {k: v / n_batches for k, v in totals.items()}
-
-
-@torch.no_grad()
-def validate_epoch(
-    model: ProbeEncoder,
-    loader: DataLoader,
-    loss_fn: CombinedLoss,
-    device: torch.device,
-) -> dict:
-    """
-    Esegue la validation sull'intero val set.
-    Calcola loss + accuracy di clustering (k-NN a 1 vicino sull'embedding).
-    """
-    model.eval()
-    totals = defaultdict(float)
-    n_batches = 0
-
-    # Raccoglie tutti gli embedding per calcolare metriche di separazione
-    all_z, all_labels = [], []
-
-    for x, labels in loader:
-        x      = x.to(device)
-        labels = labels.to(device)
-        z      = model(x, normalize=True)
-
-        loss, components = loss_fn(z, labels)
-
-        for k, v in components.items():
-            totals[k] += v
-        n_batches += 1
-
-        all_z.append(z.cpu())
-        all_labels.append(labels.cpu())
-
-    metrics = {k: v / n_batches for k, v in totals.items()}
-
-    # --- Metrica di separazione: delta cosine similarity ---
-    # Misura quanto gli embedding dello stesso device sono più simili
-    # tra loro rispetto a probe di device diversi.
-    # Un delta > 0.3 indica buona separazione; > 0.5 è ottimo.
-    Z = torch.cat(all_z).numpy()
-    L = torch.cat(all_labels).numpy()
-
-    same_sim, diff_sim = [], []
-    # Campiona max 2000 coppie per velocità (calcolo O(N^2) è lento su CPU)
-    n = min(len(Z), 500)
-    idx = np.random.choice(len(Z), n, replace=False)
-    Z_sub, L_sub = Z[idx], L[idx]
-
-    sim_matrix = Z_sub @ Z_sub.T   # cosine similarity (già L2-norm)
-    for i in range(n):
-        for j in range(i + 1, n):
-            s = float(sim_matrix[i, j])
-            if L_sub[i] == L_sub[j]:
-                same_sim.append(s)
-            else:
-                diff_sim.append(s)
-
-    if same_sim and diff_sim:
-        metrics['same_sim']  = float(np.mean(same_sim))
-        metrics['diff_sim']  = float(np.mean(diff_sim))
-        metrics['delta_sim'] = metrics['same_sim'] - metrics['diff_sim']
-    else:
-        metrics['same_sim'] = metrics['diff_sim'] = metrics['delta_sim'] = 0.0
-
-    return metrics
+from utils.train_epoch import train_epoch
+from utils.validate_epoch import validate_epoch
 
 
 # -----------------------------------------------------------------------
@@ -159,39 +39,26 @@ def validate_epoch(
 # -----------------------------------------------------------------------
 
 def train(
-    csv_path: str,
-    output_path: str = "probe_encoder.pt",
-    epochs: int = 100,
-    n_classes_per_batch: int = 20,
-    n_samples_per_class: int = 8,
-    lr: float = 5e-4,
-    weight_decay: float = 1e-4,
-    temperature: float = 0.1,
-    ce_weight: float = 0.5,
-    d_model: int = 128,
-    num_layers: int = 3,
-    embed_dim: int = 64,
-    nhead: int = 4,
-    pooling: str = "mean",
-    dropout: float = 0.1,
-    val_fraction: float = 0.15,
-    test_fraction: float = 0.10,
-    device_str: str = "auto",
-    seed: int = 42,
+    csv_path: str,                  # path al CSV delle probe request
+    output_path: str = "probe_encoder.pt", # dove salvare il checkpoint migliore
+    epochs: int = 100,              # epoche di training
+    n_classes_per_batch: int = 20,  # classi per batch nel BalancedBatchSampler
+    n_samples_per_class: int = 8,   # probe per classe per batch
+    lr: float = 5e-4,               # learning rate per AdamW
+    weight_decay: float = 1e-4,     # weight decay per AdamW
+    temperature: float = 0.1,       # temperatura della SupCon Loss
+    ce_weight: float = 0.5,         # peso della Cross Entropy ausiliaria (0 = solo SupCon)
+    d_model: int = 128,             # dimensione del modello Transformer
+    num_layers: int = 3,            # numero di layer del Transformer
+    embed_dim: int = 64,            # dimensione embedding finale
+    nhead: int = 4,                 # numero di teste multi-head nel Transformer
+    pooling: str = "mean",          # pooling: "mean" o "cls"
+    dropout: float = 0.1,           # dropout rate nel Transformer
+    val_fraction: float = 0.15,     # frazione del dataset per validation
+    test_fraction: float = 0.10,    # frazione del dataset per test
+    device_str: str = "auto",       # "auto", "cpu" o "cuda"
+    seed: int = 42,                 # seed per riproducibilità
 ):
-    """
-    Funzione di training completa. Parametri principali:
-
-    csv_path            : path al CSV delle probe request
-    output_path         : dove salvare il checkpoint migliore
-    epochs              : epoche di training
-    n_classes_per_batch : classi per batch nel BalancedBatchSampler
-    n_samples_per_class : probe per classe per batch
-    lr                  : learning rate per AdamW
-    temperature         : temperatura della SupCon Loss
-    ce_weight           : peso della Cross Entropy ausiliaria (0 = solo SupCon)
-    embed_dim           : dimensione embedding finale
-    """
     # Seed per riproducibilità
     random.seed(seed)
     np.random.seed(seed)
@@ -212,13 +79,18 @@ def train(
         X, y, val_fraction=val_fraction, test_fraction=test_fraction, seed=seed
     )
 
-    # DataLoader per training con BalancedBatchSampler
-    # batch_sampler sostituisce batch_size + shuffle (non compatibili insieme)
+    # BalancedBatchSampler seleziona gli indici di K classi e M probe per batch, 
+    # garantendo almeno M positivi per anchor. 
+    # Serve per bilanciare le classi e migliorare la qualità del training.
     balanced_sampler = BalancedBatchSampler(
         labels=train_ds.y.numpy(),
         n_classes_per_batch=n_classes_per_batch,
         n_samples_per_class=n_samples_per_class,
     )
+    
+    # train_loader usa il BalancedBatchSampler per generare batch bilanciati
+    # Ad ogni loop di training riceve una sequenza di indici dal balanced_sampler
+    # e li assembla in un tensore.
     train_loader = DataLoader(
         train_ds,
         batch_sampler=balanced_sampler,  # batch_size gestito dal sampler
@@ -229,8 +101,8 @@ def train(
     # DataLoader per validation: batch standard, niente shuffling
     val_loader = DataLoader(
         val_ds,
-        batch_size=256,
-        shuffle=False,
+        batch_size=256,                 # batch standard, più grande per velocità
+        shuffle=False,                  # ordine fisso: riproducibilità delle metriche
         num_workers=0,
     )
 
