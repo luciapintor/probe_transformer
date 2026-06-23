@@ -239,6 +239,38 @@ def embedding_separation_stats(
     print(f"  Delta           : {stats['delta']:.3f}")
     return stats
 
+def use_dbscan(X, y, eps=0.25, min_samples=3, tune=False, output_path="clusters.csv"):
+    """
+    Funzione per usare DBSCAN.
+    """
+    # Tuning eps (opzionale, richiede label)
+    if tune:
+        eps = tune_eps(X, y, min_samples=min_samples)
+
+    # Clustering
+    pred_labels = cluster_dbscan(X, eps=eps, min_samples=min_samples)
+
+    # Metriche di qualità (se abbiamo le label)
+    valid = pred_labels != -1
+    if valid.sum() > 0:
+        ari = adjusted_rand_score(y[valid], pred_labels[valid])
+        nmi = normalized_mutual_info_score(y[valid], pred_labels[valid])
+        print(f"\nMetriche clustering (probe non-rumore):")
+        print(f"  ARI: {ari:.4f}  (1.0 = perfetto, 0.0 = casuale)")
+        print(f"  NMI: {nmi:.4f}  (1.0 = perfetto, 0.0 = casuale)")
+
+    # Salva risultati
+    df_out = pd.DataFrame({
+        'true_label':    y,
+        'pred_cluster':  pred_labels,
+        'embedding_dim0': X[:, 0],   # prime 2 dim per debug/visualizzazione
+        'embedding_dim1': X[:, 1],
+    })
+    df_out.to_csv(output_path, index=False)
+    print(f"\nRisultati salvati in: {output_path}")
+    
+    return pred_labels
+
 
 # -----------------------------------------------------------------------
 # Funzione principale di inferenza
@@ -247,7 +279,8 @@ def embedding_separation_stats(
 def run_inference(
     model_path: str,
     csv_path: str,
-    output_path: str = "clusters.csv",
+    output_baseline_path: str = "baseline_clusters.csv",
+    output_embeddings_path: str = "clusters.csv",
     eps: float = 0.25,
     min_samples: int = 3,
     tune: bool = False,
@@ -268,38 +301,21 @@ def run_inference(
     # Carica dati e modello
     X, y, meta = load_csv(csv_path)
     model = load_encoder(model_path, device)
-
+    
+    # Usa DBSCAN senza embeddings come baseline per il confronto
+    print("\n--- Clustering baseline (feature originali) ---")
+    baseline_labels = use_dbscan(X, y, eps=eps, min_samples=min_samples, tune=tune, output_path=output_baseline_path)  
+    
     # Estrai embedding
+    print("\n--- Estrazione embedding ---")
     Z = extract_embeddings(model, X, device, batch_size=batch_size)
 
     # Statistiche di separazione (richiede label)
     stats = embedding_separation_stats(Z, y)
 
-    # Tuning eps (opzionale, richiede label)
-    if tune:
-        eps = tune_eps(Z, y, min_samples=min_samples)
+    # Clustering sugli embedding
 
-    # Clustering
-    pred_labels = cluster_dbscan(Z, eps=eps, min_samples=min_samples)
-
-    # Metriche di qualità (se abbiamo le label)
-    valid = pred_labels != -1
-    if valid.sum() > 0:
-        ari = adjusted_rand_score(y[valid], pred_labels[valid])
-        nmi = normalized_mutual_info_score(y[valid], pred_labels[valid])
-        print(f"\nMetriche clustering (probe non-rumore):")
-        print(f"  ARI: {ari:.4f}  (1.0 = perfetto, 0.0 = casuale)")
-        print(f"  NMI: {nmi:.4f}  (1.0 = perfetto, 0.0 = casuale)")
-
-    # Salva risultati
-    df_out = pd.DataFrame({
-        'true_label':    y,
-        'pred_cluster':  pred_labels,
-        'embedding_dim0': Z[:, 0],   # prime 2 dim per debug/visualizzazione
-        'embedding_dim1': Z[:, 1],
-    })
-    df_out.to_csv(output_path, index=False)
-    print(f"\nRisultati salvati in: {output_path}")
+    pred_labels = use_dbscan(Z, y, eps=eps, min_samples=min_samples, tune=tune, output_path=output_embeddings_path)    
 
     return Z, pred_labels, stats
 
@@ -309,9 +325,10 @@ def run_inference(
 
 if __name__ == "__main__":
     print("Inferenza ProbeEncoder")
-    model_path = "models/probe_encoder.pt"
-    csv_path = "dataset/dataset_merged_probes_csv/data_with_label/all_A_full.csv"
-    output_path = "outputs/clusters.csv"
+    model_path = "data_models/probe_encoder.pt"
+    csv_path = "data_dataset/dataset_merged_probes_csv/data_with_label/all_A_full.csv"
+    output_baseline_path = "data_outputs/baseline_clusters.csv"
+    output_embeddings_path = "data_outputs/clusters.csv"
     eps = 0.25
     min_samples = 3
     tune = False
@@ -321,7 +338,8 @@ if __name__ == "__main__":
     run_inference(
         model_path=model_path,
         csv_path=csv_path,
-        output_path=output_path,
+        output_baseline_path=output_baseline_path,
+        output_embeddings_path=output_embeddings_path,
         eps=eps,
         min_samples=min_samples,
         tune=tune,

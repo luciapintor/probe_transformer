@@ -1,6 +1,6 @@
 *.pyc
 __pycache__/
 .venv/
-dataset
-models
-outputs
+data_dataset
+data_models
+data_outputs

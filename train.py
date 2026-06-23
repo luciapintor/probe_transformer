@@ -26,12 +26,12 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
-from utils.BalancedBatchSampler import BalancedBatchSampler
+from training.BalancedBatchSampler import BalancedBatchSampler
 from utils.preprocessing import load_csv, build_datasets
 from utils.model import ProbeEncoder, TransformerConfig
-from utils.losses import CombinedLoss
-from utils.train_epoch import train_epoch
-from utils.validate_epoch import validate_epoch
+from training.losses import CombinedLoss
+from training.train_epoch import train_epoch
+from training.validate_epoch import validate_epoch
 
 
 # -----------------------------------------------------------------------
@@ -202,8 +202,8 @@ def train(
 
 if __name__ == "__main__":
     print("Addestra ProbeEncoder con Supervised Contrastive Learning")
-    csv_path = "dataset/dataset_merged_probes_csv/data_with_label/all_A_full.csv"
-    output_path = "models/probe_encoder.pt"
+    csv_path = "data_dataset/dataset_merged_probes_csv/data_with_label/all_A_full.csv"
+    output_path = "data_models/probe_encoder.pt"
     epochs = 20                     # Epoche di training (consigliato 50-100 per risultati stabili)
     n_classes_per_batch=20          # Classi per batch (BalancedBatchSampler)
     n_samples_per_class=8           # Campioni per classe per batch

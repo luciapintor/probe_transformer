@@ -4,7 +4,7 @@ from torch.utils.data import DataLoader
 from collections import defaultdict
 
 from utils.model import ProbeEncoder
-from utils.losses import CombinedLoss
+from training.losses import CombinedLoss
 
 def train_epoch(
     model: ProbeEncoder,
