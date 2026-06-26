@@ -13,6 +13,7 @@ def cluster_dbscan(
     Z: np.ndarray,
     eps: float = 0.25,
     min_samples: int = 3,
+    metric: str = 'cosine',
 ) -> np.ndarray:
     """
     Applica DBSCAN sugli embedding con metrica cosine.
@@ -35,7 +36,7 @@ def cluster_dbscan(
     -----------
     labels : (N,) array int, -1 = rumore (non clusterizzato)
     """
-    db = DBSCAN(eps=eps, min_samples=min_samples, metric='cosine', n_jobs=-1)
+    db = DBSCAN(eps=eps, min_samples=min_samples, metric=metric, n_jobs=-1)
     labels = db.fit_predict(Z)
 
     n_clusters = len(set(labels)) - (1 if -1 in labels else 0)
@@ -44,7 +45,7 @@ def cluster_dbscan(
           f"({100*n_noise/len(Z):.1f}%)")
     return labels
 
-def use_dbscan(X, y, eps=0.25, min_samples=3, tune=False, output_path="clusters.csv"):
+def use_dbscan(X, y, eps=0.25, min_samples=3, tune=False, output_path="clusters.csv", metric='cosine'):
     """
     Funzione per usare DBSCAN.
     """
@@ -53,7 +54,7 @@ def use_dbscan(X, y, eps=0.25, min_samples=3, tune=False, output_path="clusters.
         eps = tune_eps(X, y, min_samples=min_samples)
 
     # Clustering
-    pred_labels = cluster_dbscan(X, eps=eps, min_samples=min_samples)
+    pred_labels = cluster_dbscan(X, eps=eps, min_samples=min_samples, metric=metric)
 
     # Metriche di qualità (se abbiamo le label)
     valid = pred_labels != -1

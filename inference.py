@@ -67,7 +67,7 @@ def run_inference(
     
     # Usa DBSCAN senza embeddings come baseline per il confronto
     print("\n--- Clustering baseline (feature originali) ---")
-    baseline_labels = use_dbscan(X, y, eps=eps, min_samples=min_samples, tune=tune, output_path=output_baseline_path)  
+    baseline_labels = use_dbscan(X, y, eps=eps, min_samples=min_samples, metric='euclidean', tune=tune, output_path=output_baseline_path)  
     
     # Estrai embedding
     print("\n--- Estrazione embedding ---")
@@ -78,7 +78,7 @@ def run_inference(
 
     # Clustering sugli embedding
 
-    pred_labels = use_dbscan(Z, y, eps=eps, min_samples=min_samples, tune=tune, output_path=output_embeddings_path)    
+    pred_labels = use_dbscan(Z, y, eps=eps, min_samples=min_samples, metric='cosine', tune=tune, output_path=output_embeddings_path)    
 
     return Z, pred_labels, stats
 
