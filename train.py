@@ -42,6 +42,7 @@ from training.validate_epoch import validate_epoch
 
 def train(
     csv_path: str,                  # path al CSV delle probe request
+    excluded_features: list[str],   # feature da escludere dal training
     output_path: str = "probe_encoder.pt", # dove salvare il checkpoint migliore
     schema: "FeatureSchema | None" = None, # schema delle feature (None = default probe schema)
     epochs: int = 10,               # epoche di training
@@ -77,7 +78,7 @@ def train(
     # ----------------------------------------------------------------
     # Caricamento dati
     # ----------------------------------------------------------------
-    X, y, meta = load_csv(csv_path)
+    X, y, meta = load_csv(path=csv_path, excluded_features=excluded_features)
     train_ds, val_ds, test_ds = build_datasets(
         X, y, val_fraction=val_fraction, test_fraction=test_fraction, seed=seed
     )
@@ -227,10 +228,11 @@ def train(
 # -----------------------------------------------------------------------
 
 if __name__ == "__main__":
+    from config import csv_path, model_path, excluded_features
+    
     print("Addestra ProbeEncoder con Supervised Contrastive Learning")
-    csv_path = "data_dataset/dataset_merged_probes_csv/data_with_label/all_A_full.csv"
-    output_path = "data_models/probe_encoder.pt"
-    epochs = 10                     # Epoche di training (consigliato 50-100 per risultati stabili)
+    
+    epochs = 5                     # Epoche di training (consigliato 50-100 per risultati stabili)
     n_classes_per_batch=20          # Classi per batch (BalancedBatchSampler)
     n_samples_per_class=8           # Campioni per classe per batch
     lr = 5e-4                       # Learning rate per AdamW
@@ -242,10 +244,11 @@ if __name__ == "__main__":
     pooling = "mean"                # Pooling: "mean" o "cls"
     device = "auto"                 # "auto", "cpu" o "cuda"
     seed = 42                       # Seed per riproducibilità
-   
+    
     train(
         csv_path=csv_path,
-        output_path=output_path,
+        excluded_features=excluded_features,
+        output_path=model_path,
         epochs=epochs,
         n_classes_per_batch=n_classes_per_batch,
         n_samples_per_class=n_samples_per_class,

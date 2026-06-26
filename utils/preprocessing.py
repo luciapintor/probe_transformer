@@ -70,16 +70,14 @@ from utils.feature_schema import build_probe_schema
 # Funzione di preprocessing dell'intero DataFrame
 # -----------------------------------------------------------------------
 
-def preprocess_dataframe(df: pd.DataFrame) -> tuple[np.ndarray, np.ndarray]:
+def preprocess_dataframe(df: pd.DataFrame, excluded_features: list[str]) -> tuple[np.ndarray, np.ndarray]:
     """
+    Esclude le feature non rilevanti, converte le feature rimanenti in tensori
+    e rimappa le label in indici contigui 0..n-1.
     Converte l'intero DataFrame in:
       X : np.ndarray di shape (N, M) con le feature di ogni probe
       y : np.ndarray di shape (N,) con le label intere dei device
     """
-    
-    # Schema completo (equivale al preprocessing originale, 86 feature)
-    schema = build_probe_schema()
-    X = schema.transform(df)        # (N, 86)
     
     # Rimappa le label in indici contigui 0..n-1
     # (nel CSV le label sono 1,2,3,...,62,... non necessariamente contigue)
@@ -87,11 +85,18 @@ def preprocess_dataframe(df: pd.DataFrame) -> tuple[np.ndarray, np.ndarray]:
     unique_labels = sorted(set(raw_labels))
     label_to_idx = {lbl: idx for idx, lbl in enumerate(unique_labels)}
     y = np.array([label_to_idx[l] for l in raw_labels], dtype=np.int64)
+    
+    # Esclude le feature non rilevanti
+    df = df.drop(columns=excluded_features)
+    
+    # Schema completo (equivale al preprocessing originale, 86 feature)
+    schema = build_probe_schema()
+    X = schema.transform(df)        # (N, 86)
 
     return X.astype(np.float32), y
 
 
-def load_csv(path: str) -> tuple[np.ndarray, np.ndarray, dict]:
+def load_csv(path: str, excluded_features: list[str]) -> tuple[np.ndarray, np.ndarray, dict]:
     """
     Carica il CSV, applica il preprocessing e restituisce:
       X       : (N, M) float32
@@ -101,7 +106,7 @@ def load_csv(path: str) -> tuple[np.ndarray, np.ndarray, dict]:
     df = pd.read_csv(path)
     print(f"CSV caricato: {len(df)} righe, {df['label'].nunique()} device unici")
 
-    X, y = preprocess_dataframe(df)
+    X, y = preprocess_dataframe(df, excluded_features=excluded_features)
 
     # Mappa inversa idx -> label originale (utile per interpretare i risultati)
     raw_labels = df['label'].values

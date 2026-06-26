@@ -41,6 +41,7 @@ from utils.preprocessing import load_csv
 def run_inference(
     model_path: str,
     csv_path: str,
+    excluded_features: list[str],
     output_baseline_path: str = "baseline_clusters.csv",
     output_embeddings_path: str = "clusters.csv",
     eps: float = 0.25,
@@ -61,7 +62,7 @@ def run_inference(
         device = torch.device(device_str)
 
     # Carica dati e modello
-    X, y, meta = load_csv(csv_path)
+    X, y, meta = load_csv(csv_path, excluded_features=excluded_features)
     model = load_encoder(model_path, device)
     
     # Usa DBSCAN senza embeddings come baseline per il confronto
@@ -86,11 +87,9 @@ def run_inference(
 # -----------------------------------------------------------------------
 
 if __name__ == "__main__":
+    from config import csv_path, model_path, excluded_features, baseline_path, embeddings_path 
+        
     print("Inferenza ProbeEncoder")
-    model_path = "data_models/probe_encoder.pt"
-    csv_path = "data_dataset/dataset_merged_probes_csv/data_with_label/all_A_full.csv"
-    output_baseline_path = "data_outputs/baseline_clusters.csv"
-    output_embeddings_path = "data_outputs/clusters.csv"
     eps = 0.25
     min_samples = 3
     tune = False
@@ -100,8 +99,9 @@ if __name__ == "__main__":
     run_inference(
         model_path=model_path,
         csv_path=csv_path,
-        output_baseline_path=output_baseline_path,
-        output_embeddings_path=output_embeddings_path,
+        excluded_features=excluded_features,
+        output_baseline_path=baseline_path,
+        output_embeddings_path=embeddings_path,
         eps=eps,
         min_samples=min_samples,
         tune=tune,
