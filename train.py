@@ -26,9 +26,11 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
-from training.BalancedBatchSampler import BalancedBatchSampler
+from utils.feature_schema import FeatureSchema
 from utils.preprocessing import load_csv, build_datasets
 from utils.model import ProbeEncoder, TransformerConfig
+from utils.feature_schema import build_probe_schema
+from training.BalancedBatchSampler import BalancedBatchSampler
 from training.losses import CombinedLoss
 from training.train_epoch import train_epoch
 from training.validate_epoch import validate_epoch
@@ -41,7 +43,8 @@ from training.validate_epoch import validate_epoch
 def train(
     csv_path: str,                  # path al CSV delle probe request
     output_path: str = "probe_encoder.pt", # dove salvare il checkpoint migliore
-    epochs: int = 100,              # epoche di training
+    schema: "FeatureSchema | None" = None, # schema delle feature (None = default probe schema)
+    epochs: int = 10,               # epoche di training
     n_classes_per_batch: int = 20,  # classi per batch nel BalancedBatchSampler
     n_samples_per_class: int = 8,   # probe per classe per batch
     lr: float = 5e-4,               # learning rate per AdamW
@@ -123,10 +126,33 @@ def train(
         dropout=dropout,
         pooling=pooling,
     )
-    model = ProbeEncoder(config).to(device)
+    
+    # ----------------------------------------------------------------
+    # Schema delle feature
+    # ----------------------------------------------------------------
+    # Se non viene passato uno schema esplicito, usa quello di default
+    # per il dataset probe request (build_probe_schema()).
+    # Per adattare il codice a un nuovo dataset, costruire uno schema
+    # personalizzato e passarlo come parametro:
+    #
+    #   my_schema = FeatureSchema([BinaryExtractor("is_ios"), ...])
+    #   train(csv_path="new_data.csv", schema=my_schema)
+    #
+    if schema is None:
+        schema = build_probe_schema()
+    print(f"Schema: {schema.dim} feature, {len(schema.groups)} token")
+    
+    # ProbeEncoder riceve lo schema per sapere come suddividere il
+    # vettore flat in token. feature_dim e feature_groups vengono
+    # ricavati automaticamente da schema.dim e schema.groups.
+    # Il modello viene costruito con lo schema come vocabolario GLOBALE.
+    # Ogni feature scalare nel vettore flat diventa un token separato
+    # (feature-level tokenization). In training tutti gli IE sono presenti,
+    # quindi active_ie_names non viene passato e il modello riceve
+    # sempre il vettore completo.
+    model = ProbeEncoder(config, global_schema=schema).to(device)
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"Parametri trainable: {n_params:,}")
-
     # ----------------------------------------------------------------
     # Loss, ottimizzatore, scheduler
     # ----------------------------------------------------------------
@@ -204,7 +230,7 @@ if __name__ == "__main__":
     print("Addestra ProbeEncoder con Supervised Contrastive Learning")
     csv_path = "data_dataset/dataset_merged_probes_csv/data_with_label/all_A_full.csv"
     output_path = "data_models/probe_encoder.pt"
-    epochs = 20                     # Epoche di training (consigliato 50-100 per risultati stabili)
+    epochs = 10                     # Epoche di training (consigliato 50-100 per risultati stabili)
     n_classes_per_batch=20          # Classi per batch (BalancedBatchSampler)
     n_samples_per_class=8           # Campioni per classe per batch
     lr = 5e-4                       # Learning rate per AdamW

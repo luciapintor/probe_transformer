@@ -1,107 +1,93 @@
 """
 model.py
 ========
-Encoder transformer per probe request Wi-Fi.
+Encoder transformer con feature-level tokenization.
 
-Idea di base
-------------
-Ogni probe è un vettore flat di FEATURE_DIM (79) feature numeriche.
-Vogliamo un encoder f(x) -> z tale che:
-  - z_i ~= z_j  se probe i e j provengono dallo stesso device
-  - z_i far da z_j  se provengono da device diversi
+Idea
+----
+Invece di raggruppare le feature per IE (un token per IE), ogni singola
+feature scalare nel vettore flat diventa un token separato nella sequenza
+del transformer. Con 86 feature si hanno 86 token.
 
-L'encoder viene addestrato con Supervised Contrastive Loss, che
-usa le label reali per definire quali coppie sono positive.
+Vantaggi rispetto alla group-level tokenization:
+  - L'attention opera direttamente tra feature individuali, senza la
+    mediazione del raggruppamento. Il modello può imparare correlazioni
+    come "ie1_rates__3 e ie45_ht_cap__0 tendono a co-occorrere nei
+    device Apple" senza dover prima aggregare all'interno del gruppo.
+  - La granularità è massima: nessuna perdita di informazione nel
+    passaggio group_dim -> d_model.
 
-Architettura: "Feature Group Tokenizer + Transformer Encoder"
+Svantaggi:
+  - Sequenza più lunga (86 token invece di 10): più operazioni di attention,
+    ma con d_model piccolo e num_layers basso rimane gestibile.
+  - Meno interpretabile: è più difficile leggere i pesi di attention
+    quando i token sono singole feature numeriche.
+
+Token type embedding (per nome, non per posizione)
+--------------------------------------------------
+Ogni feature ha un nome semantico costruito come '{ie_name}__{feat_idx}'
+(es. 'ie45_ht_cap__2'). Il modello impara un embedding vettoriale per
+ogni nome, così:
+  - 'ie45_ht_cap__2' riceve sempre lo stesso embedding indipendentemente
+    da quante altre feature ci sono (schema variabile tra dataset).
+  - Se un IE è assente nel dataset, le sue feature vengono sostituite
+    dal missing_token learnable, che il modello impara a interpretare
+    come "questa feature non era disponibile".
+
+IE di appartenenza come embedding aggiuntivo (ie_type_embed)
 -------------------------------------------------------------
-Invece di trattare il vettore flat come un singolo token (che darebbe
-al transformer nessuna struttura su cui ragionare con l'attention),
-dividiamo le 79 feature in gruppi logici basati sull'IE di provenienza.
-Ogni gruppo diventa un token separato.
+Oltre al token embedding per nome, ogni feature riceve anche un
+embedding che segnala il suo IE di appartenenza (es. 'ie45_ht_cap').
+Questo aiuta il modello a raggruppare implicitamente le feature dello
+stesso IE senza imporre un raggruppamento esplicito nella sequenza.
+L'embedding finale di ogni token è:
 
-Questo permette all'attention di imparare QUALI IE sono più informativi
-per distinguere i device, e come i diversi IE si relazionano tra loro.
-
-Gruppi di token:
-  token 0 : is_ios + SSID features       (4 feature)
-  token 1 : ie1  supported rates         (17 feature: 16 multi-hot + lunghezza)
-  token 2 : ie50 extended rates          (10 feature: 8 multi-hot + presente + lunghezza)
-  token 3 : ie127 extended capabilities  (12 feature: 10 padded + lunghezza + ie127_1)
-  token 4 : ie45  HT capabilities        (17 feature)
-  token 5 : ie221 vendor specific        (12 feature)
-  token 6 : ie191 VHT capabilities       (2 feature)
-  token 7 : ie107 interworking           (5 feature)
-
-Ogni token ha dimensione diversa -> una Linear per gruppo porta tutti
-a d_model prima del transformer.
+    token = proj(feature_value) + token_name_embed + ie_type_embed
 
 Schema del forward pass:
-  x (B, FEATURE_DIM)
-  -> split in 8 gruppi -> 8 Linear -> (B, 8, d_model)
-  -> + positional embedding (learnable, 8 posizioni)
-  -> TransformerEncoder (N layer, self-attention tra i token)
-  -> mean pooling dei token -> (B, d_model)
-  -> projection head -> (B, embed_dim)
+  x (B, n_active_features)
+  -> per ogni feature nel vocabolario globale:
+       se attiva: Linear(1, d_model)(x[:, pos])
+       se assente: missing_token
+  -> (B, n_global_features, d_model)
+  -> + token_name_embed[nome] + ie_type_embed[ie_name]
+  -> TransformerEncoder
+  -> mean pooling o CLS
+  -> projection head
   -> L2 normalize -> z (B, embed_dim)
+
+Gestione degli IE mancanti
+---------------------------
+Come nel precedente modello a gruppi, `active_ie_names` in forward()
+specifica quali IE sono presenti nel batch. Le feature degli IE assenti
+ricevono il missing_token. L'input x deve contenere solo le feature
+degli IE attivi, nell'ordine del vocabolario globale.
 """
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from dataclasses import dataclass, field
+from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
-
-# -----------------------------------------------------------------------
-# Definizione dei gruppi di feature (token)
-# Le dimensioni devono sommare a FEATURE_DIM = 79
-# -----------------------------------------------------------------------
-
-# Ogni entry: (nome, slice) dove slice indica le posizioni nel vettore flat
-FEATURE_GROUPS = [
-    ("ios_ssid",   slice(0,  4)),    #  4 feature: is_ios + SSID (3)
-    ("ie1",        slice(4,  21)),   # 17 feature: 16 multi-hot + 1 lunghezza
-    ("ie50",       slice(21, 31)),   # 10 feature: 8 multi-hot + presente + lunghezza
-    ("ie127_0",    slice(31, 42)),   # 11 feature: 10 padded + lunghezza
-    ("ie127_1",    slice(42, 51)),   #  9 feature: padded a lunghezza 9
-    ("ie45",       slice(51, 68)),   # 17 feature: 17 subcampi HT
-    ("ie221",      slice(68, 80)),   # 12 feature: 4 slot * 3
-    ("ie191",      slice(80, 82)),   #  2 feature: presente + valore
-    ("ie107",      slice(82, 87)),   #  5 feature: 5 subcampi interworking
-]
-
-# Verifica che i gruppi coprano esattamente FEATURE_DIM feature senza buchi
-_EXPECTED_FEATURE_DIM = 87
-_covered = sum(s.stop - s.start for _, s in FEATURE_GROUPS)
-assert _covered == _EXPECTED_FEATURE_DIM, (
-    f"I gruppi coprono {_covered} feature, attese {_EXPECTED_FEATURE_DIM}"
-)
-
-N_TOKENS = len(FEATURE_GROUPS)   # 9 token
+if TYPE_CHECKING:
+    from feature_schema import FeatureSchema, FeatureToken
 
 
 @dataclass
 class TransformerConfig:
     """
-    Parametri dell'architettura. Tutti hanno un default ragionevole
-    per il dataset in questione (~32k probe, 39 device, 79 feature).
+    Iperparametri dell'architettura.
 
-    d_model : dimensione interna del transformer. Deve essere divisibile
-              per nhead. Valori tipici: 64, 128, 256.
-    nhead   : numero di attention head. Più heads -> più pattern paralleli.
-              Con 8 token, 4 head sono abbondanti.
-    num_layers : numero di TransformerEncoderLayer. 2-4 è sufficiente per
-                 sequenze corte (8 token). Più layer -> più capacità ma
-                 rischio overfitting su dataset piccoli.
-    dim_feedforward : dimensione del FF interno di ogni layer.
-                      Convenzione: 2x o 4x d_model.
-    embed_dim : dimensione dello spazio di embedding finale z.
-                Più piccolo -> più compresso, più facile da clusterizzare.
-                Valori tipici: 32, 64, 128.
-    dropout   : dropout applicato sia nel transformer sia nel projection head.
-    pooling   : come aggregare gli 8 token in output.
-                "mean" = media di tutti i token (robusto)
-                "cls"  = token CLS aggiunto in testa (stile BERT)
+    d_model         : dimensione interna. Divisibile per nhead.
+                      Con feature-level tokenization e 86 token,
+                      valori più piccoli (64-128) sono sufficienti.
+    nhead           : attention head. Con 86 token, 4-8 head funzionano bene.
+    num_layers      : layer del transformer. 2-4 per sequenze corte.
+    dim_feedforward : FF interno (convenzione: 2x-4x d_model).
+    embed_dim       : dimensione embedding finale z.
+    dropout         : dropout nel transformer e nel projection head.
+    pooling         : "mean" (default) o "cls".
     """
     d_model: int = 128
     nhead: int = 4
@@ -109,55 +95,122 @@ class TransformerConfig:
     dim_feedforward: int = 256
     embed_dim: int = 64
     dropout: float = 0.1
-    pooling: str = "mean"   # "mean" | "cls"
+    pooling: str = "mean"
 
 
 class ProbeEncoder(nn.Module):
     """
-    Encoder che mappa una probe request -> embedding vettore normalizzato.
+    Encoder con feature-level tokenization e vocabolario globale.
 
-    Uso tipico:
-        encoder = ProbeEncoder(TransformerConfig())
-        z = encoder(x)   # x: (B, 79), z: (B, embed_dim) L2-norm
+    Ogni feature scalare nel vettore flat è un token separato.
+    Il modello viene costruito su un vocabolario globale di tutte
+    le feature possibili. In inferenza, le feature degli IE mancanti
+    vengono sostituite dal missing_token learnable.
+
+    Costruzione
+    -----------
+    Richiede lo schema globale (o la lista di FeatureToken globali)
+    per costruire:
+      - una Linear(1, d_model) per ogni feature nel vocabolario
+      - il token_name_embed (un vettore per nome feature)
+      - il ie_type_embed (un vettore per nome IE)
+
+    Parametri
+    ---------
+    config         : TransformerConfig
+    global_schema  : FeatureSchema che definisce il vocabolario completo.
+                     Il modello usa global_schema.feature_tokens() per
+                     ricavare la lista di tutti i token possibili.
+    global_tokens  : lista di FeatureToken se global_schema è None
+                     (per ricostruire da checkpoint senza schema).
     """
 
-    def __init__(self, config: TransformerConfig):
+    def __init__(
+        self,
+        config: TransformerConfig,
+        global_schema: "FeatureSchema | None" = None,
+        global_tokens: list | None = None,
+    ):
         super().__init__()
         self.config = config
 
-        # --- Proiezioni per-gruppo ---
-        # Ogni gruppo di feature ha dimensione diversa; una Linear
-        # separata porta ciascun gruppo a d_model.
-        # Usiamo nn.ModuleList per registrare correttamente i parametri.
-        self.group_projs = nn.ModuleList([
-            nn.Sequential(
-                nn.Linear(s.stop - s.start, config.d_model),
-                nn.LayerNorm(config.d_model),
-                nn.GELU(),
-            )
-            for _, s in FEATURE_GROUPS
+        # --- Vocabolario globale di FeatureToken ---
+        if global_schema is not None:
+            self._global_tokens: list = global_schema.feature_tokens()
+        elif global_tokens is not None:
+            self._global_tokens = global_tokens
+        else:
+            raise ValueError("Fornire 'global_schema' oppure 'global_tokens'.")
+
+        n_global = len(self._global_tokens)
+
+        # Indici rapidi per nome feature e nome IE
+        self._feat_name_to_idx: dict[str, int] = {
+            t.name: i for i, t in enumerate(self._global_tokens)
+        }
+        # Vocabolario degli IE: nomi unici nell'ordine di prima comparsa
+        seen_ie: dict[str, int] = {}
+        for t in self._global_tokens:
+            if t.ie_name not in seen_ie:
+                seen_ie[t.ie_name] = len(seen_ie)
+        self._ie_name_to_idx: dict[str, int] = seen_ie
+
+        # --- Proiezione per ogni feature: Linear(1, d_model) ---
+        # Una Linear separata per ogni feature permette al modello di
+        # imparare una scala e un bias specifici per ciascuna.
+        # Con 86 feature sono 86 Linear(1, d_model): piccole ma tante.
+        # Alternativa più compatta: un unico Linear(1, d_model) condiviso
+        # + token_name_embed per differenziare. Scegliamo Linear separate
+        # perché le feature hanno scale molto diverse (binarie, tanh, hash).
+        self.feat_projs = nn.ModuleList([
+            nn.Linear(1, config.d_model)
+            for _ in range(n_global)
         ])
 
-        # --- CLS token (opzionale, se pooling == "cls") ---
+        # --- missing_token ---
+        # Vettore learnable (d_model,) per le feature degli IE assenti.
+        # Condiviso tra tutte le feature mancanti (un unico segnale di assenza).
+        self.missing_token = nn.Parameter(torch.zeros(config.d_model))
+
+        # --- CLS token (opzionale) ---
         if config.pooling == "cls":
-            # Learnable vector aggiunto come primo token della sequenza
             self.cls_token = nn.Parameter(torch.randn(1, 1, config.d_model))
 
-        # --- Positional embedding ---
-        # Learnable: il modello impara l'importanza relativa della posizione
-        # di ogni IE nella sequenza (es. ie45 è sempre token 4).
-        n_pos = N_TOKENS + (1 if config.pooling == "cls" else 0)
-        self.pos_embed = nn.Embedding(n_pos, config.d_model)
+        # --- Token name embedding ---
+        # Un vettore per ogni nome feature (es. 'ie45_ht_cap__2').
+        # Stabile al cambiamento di schema: 'ie45_ht_cap__2' riceve
+        # sempre lo stesso embedding indipendentemente dalla posizione.
+        n_embed_names = n_global + (1 if config.pooling == "cls" else 0)
+        self._embed_names: list[str] = (
+            ["__cls__"] if config.pooling == "cls" else []
+        ) + [t.name for t in self._global_tokens]
+        self._embed_name_to_idx: dict[str, int] = {
+            name: i for i, name in enumerate(self._embed_names)
+        }
+        self.token_name_embed = nn.Embedding(n_embed_names, config.d_model)
+
+        # --- IE type embedding ---
+        # Un vettore per ogni IE (es. 'ie45_ht_cap').
+        # Tutte le feature dello stesso IE condividono questo embedding,
+        # che aiuta il modello a raggruppare implicitamente le feature
+        # correlate senza imporre un raggruppamento esplicito.
+        # Il CLS token usa l'IE riservato '__cls__'.
+        ie_vocab = (
+            {"__cls__": 0} if config.pooling == "cls" else {}
+        )
+        for ie_name, idx in self._ie_name_to_idx.items():
+            ie_vocab[ie_name] = idx + (1 if config.pooling == "cls" else 0)
+        self._ie_vocab: dict[str, int] = ie_vocab
+        self.ie_type_embed = nn.Embedding(len(ie_vocab), config.d_model)
 
         # --- Transformer Encoder ---
-        # Pre-LN (norm_first=True) è più stabile in training con lr alte
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=config.d_model,
             nhead=config.nhead,
             dim_feedforward=config.dim_feedforward,
             dropout=config.dropout,
-            batch_first=True,    # (batch, seq, feature) invece di (seq, batch, feature)
-            norm_first=True,     # Pre-LN: LayerNorm prima dell'attention
+            batch_first=True,
+            norm_first=True,
         )
         self.transformer = nn.TransformerEncoder(
             encoder_layer,
@@ -166,10 +219,6 @@ class ProbeEncoder(nn.Module):
         )
 
         # --- Projection head ---
-        # Mappa d_model -> embed_dim dopo il pooling.
-        # Due layer con GELU: il primo espande leggermente, il secondo proietta.
-        # In letteratura (SimCLR, SupCon) un projection head non-lineare
-        # migliora la qualità degli embedding rispetto a una proiezione lineare.
         self.proj_head = nn.Sequential(
             nn.Linear(config.d_model, config.d_model),
             nn.GELU(),
@@ -177,15 +226,9 @@ class ProbeEncoder(nn.Module):
             nn.Linear(config.d_model, config.embed_dim),
         )
 
-        # Inizializzazione dei pesi
         self._init_weights()
 
     def _init_weights(self):
-        """
-        Inizializzazione dei pesi con Xavier uniform per le Linear,
-        che funziona bene con GELU e riduce la varianza dei gradienti
-        nei primi passi di training.
-        """
         for module in self.modules():
             if isinstance(module, nn.Linear):
                 nn.init.xavier_uniform_(module.weight)
@@ -193,63 +236,154 @@ class ProbeEncoder(nn.Module):
                     nn.init.zeros_(module.bias)
             elif isinstance(module, nn.Embedding):
                 nn.init.normal_(module.weight, std=0.02)
+        nn.init.zeros_(self.missing_token)
 
-    def forward(self, x: torch.Tensor, normalize: bool = True) -> torch.Tensor:
+    # ------------------------------------------------------------------
+    # Proprietà
+    # ------------------------------------------------------------------
+
+    @property
+    def n_global_features(self) -> int:
+        """Numero di feature nel vocabolario globale (= lunghezza sequenza)."""
+        return len(self._global_tokens)
+
+    @property
+    def global_dim(self) -> int:
+        """Dimensione del vettore con TUTTE le feature attive."""
+        return len(self._global_tokens)
+
+    @property
+    def global_ie_names(self) -> list[str]:
+        """Nomi degli IE nel vocabolario globale, in ordine canonico."""
+        return list(self._ie_name_to_idx.keys())
+
+    def active_dim(self, active_ie_names: list[str]) -> int:
+        """
+        Calcola la dimensione del vettore di input per un sottoinsieme
+        di IE attivi. Utile per verificare l'input prima di forward().
+        """
+        return sum(
+            1 for t in self._global_tokens
+            if t.ie_name in set(active_ie_names)
+        )
+
+    # ------------------------------------------------------------------
+    # Forward
+    # ------------------------------------------------------------------
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        active_ie_names: list[str] | None = None,
+        normalize: bool = True,
+    ) -> torch.Tensor:
         """
         Parametri
         ---------
-        x         : (B, FEATURE_DIM) tensore di feature float32
-        normalize : se True, L2-normalizza l'embedding output.
-                    Deve essere True durante training con SupCon Loss.
-                    Può essere False se si vuole l'embedding grezzo.
+        x : (B, n_active_features) float32
+            Vettore con le feature degli IE attivi, nell'ordine in cui
+            compaiono nel vocabolario globale (non nell'ordine di
+            active_ie_names). Ogni feature è uno scalare.
+            Se active_ie_names è None, x deve contenere tutte le feature
+            (x.size(1) == n_global_features).
+
+        active_ie_names : lista dei nomi degli IE presenti nel batch.
+            None = tutti gli IE del vocabolario sono presenti.
+            Esempio: ['ie1_rates', 'ie45_ht_cap'] se gli altri IE mancano.
+
+        normalize : L2-normalizza l'output se True.
 
         Restituisce
         -----------
-        z : (B, embed_dim) embedding delle probe
+        z : (B, embed_dim)
         """
         B = x.size(0)
 
-        # 1. Dividi il vettore flat in gruppi e proietta ciascuno a d_model
-        #    Risultato: lista di (B, d_model), poi stack -> (B, N_TOKENS, d_model)
+        if active_ie_names is None:
+            active_ie_set = set(self._ie_name_to_idx.keys())
+        else:
+            active_ie_set = set(active_ie_names)
+
+        # ------------------------------------------------------------------
+        # Costruisce la sequenza di token in ordine canonico del vocabolario
+        # ------------------------------------------------------------------
+        # Per ogni feature nel vocabolario globale:
+        #   - se il suo IE è attivo: proietta il valore scalare con feat_projs[i]
+        #   - se il suo IE è assente: usa missing_token
+        #
+        # Le feature in x sono nell'ordine canonico (solo quelle degli IE attivi).
+        # x_offset scorre x leggendo una feature alla volta.
+
         token_list = []
-        for i, (_, s) in enumerate(FEATURE_GROUPS):
-            group_feat = x[:, s]            # (B, group_dim)
-            token = self.group_projs[i](group_feat)  # (B, d_model)
+        x_offset = 0
+
+        for i, feat_token in enumerate(self._global_tokens):
+            if feat_token.ie_name in active_ie_set:
+                # Feature attiva: legge il valore scalare e lo proietta
+                # x[:, x_offset] ha shape (B,); unsqueeze(-1) -> (B, 1)
+                feat_val = x[:, x_offset].unsqueeze(-1)       # (B, 1)
+                token    = self.feat_projs[i](feat_val)        # (B, d_model)
+                x_offset += 1
+            else:
+                # Feature assente: usa missing_token per tutte le feature
+                # di questo IE (non solo per l'IE nel suo insieme)
+                token = self.missing_token.unsqueeze(0).expand(B, -1)  # (B, d_model)
+
             token_list.append(token)
-        tokens = torch.stack(token_list, dim=1)   # (B, N_TOKENS, d_model)
 
-        # 2. Aggiungi CLS token se richiesto
+        assert x_offset == x.size(1), (
+            f"x ha {x.size(1)} feature ma gli IE attivi ne richiedono {x_offset}. "
+            f"Verificare che active_ie_names corrisponda alle colonne in x "
+            f"e che le feature siano nell'ordine del vocabolario globale."
+        )
+
+        tokens = torch.stack(token_list, dim=1)   # (B, n_global, d_model)
+
+        # ------------------------------------------------------------------
+        # CLS token (opzionale)
+        # ------------------------------------------------------------------
         if self.config.pooling == "cls":
-            cls = self.cls_token.expand(B, -1, -1)   # (B, 1, d_model)
-            tokens = torch.cat([cls, tokens], dim=1)  # (B, N_TOKENS+1, d_model)
+            cls    = self.cls_token.expand(B, -1, -1)
+            tokens = torch.cat([cls, tokens], dim=1)
 
-        # 3. Aggiungi positional embedding
-        #    Le posizioni sono 0, 1, ..., N_TOKENS (o N_TOKENS+1 con CLS)
-        seq_len = tokens.size(1)
-        positions = torch.arange(seq_len, device=x.device).unsqueeze(0)  # (1, seq_len)
-        tokens = tokens + self.pos_embed(positions)   # broadcast su batch
+        # ------------------------------------------------------------------
+        # Token name embedding + IE type embedding
+        # ------------------------------------------------------------------
+        # Ogni token riceve la somma di due embedding:
+        #   1. token_name_embed: specifico per questa feature ('ie45_ht_cap__2')
+        #   2. ie_type_embed: condiviso tra tutte le feature dello stesso IE
+        #
+        # La somma permette al modello di distinguere le feature sia
+        # individualmente che per appartenenza all'IE.
 
-        # 4. Transformer Encoder
-        #    Nessuna padding mask: tutte le probe hanno sempre tutti i token
-        #    (anche gli IE assenti diventano token con valori -1.0, non vengono
-        #     mascherati, perché l'assenza stessa è un'informazione)
+        embed_indices = torch.tensor(
+            [self._embed_name_to_idx[n] for n in self._embed_names],
+            dtype=torch.long, device=x.device,
+        ).unsqueeze(0)   # (1, seq_len)
+
+        ie_indices = torch.tensor(
+            [self._ie_vocab.get("__cls__", 0)] * (1 if self.config.pooling == "cls" else 0)
+            + [self._ie_vocab[t.ie_name] for t in self._global_tokens],
+            dtype=torch.long, device=x.device,
+        ).unsqueeze(0)   # (1, seq_len)
+
+        tokens = (
+            tokens
+            + self.token_name_embed(embed_indices)
+            + self.ie_type_embed(ie_indices)
+        )
+
+        # ------------------------------------------------------------------
+        # Transformer + pooling + projection
+        # ------------------------------------------------------------------
         out = self.transformer(tokens)   # (B, seq_len, d_model)
 
-        # 5. Pooling: aggrega i token in un singolo vettore per probe
         if self.config.pooling == "cls":
-            # Usa solo il CLS token (posizione 0), che ha "visto" tutti gli altri
-            # tramite self-attention
-            pooled = out[:, 0, :]    # (B, d_model)
+            pooled = out[:, 0, :]
         else:
-            # Media di tutti i token: robusta, funziona bene con sequenze corte
-            pooled = out.mean(dim=1)  # (B, d_model)
+            pooled = out.mean(dim=1)
 
-        # 6. Projection head -> embedding finale
-        z = self.proj_head(pooled)   # (B, embed_dim)
-
-        # 7. L2-normalizzazione: porta z sulla sfera unitaria
-        #    Necessario per la SupCon Loss e per DBSCAN con metrica cosine
+        z = self.proj_head(pooled)
         if normalize:
             z = F.normalize(z, dim=-1)
-
         return z
